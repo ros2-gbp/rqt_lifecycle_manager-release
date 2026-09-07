@@ -23,15 +23,19 @@ thread) is never blocked waiting for a response.
 
 from __future__ import annotations
 
+import threading
 from typing import Callable, Dict, List, Set, Tuple
 
-from lifecycle_msgs.msg import Transition
+from lifecycle_msgs.msg import Transition, TransitionEvent
 from lifecycle_msgs.srv import ChangeState, GetAvailableTransitions, GetState
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.client import Client
 from rclpy.node import Node
+from rclpy.subscription import Subscription
 
 # Type aliases for the result callbacks used to marshal data back to the GUI.
+# StateCallback is reused for transition_event notifications: both report
+# (node_name, state_id, state_label).
 StateCallback = Callable[[str, int, str], None]
 TransitionsCallback = Callable[[str, List[Tuple[int, str, str]]], None]
 ChangeStateCallback = Callable[[str, bool, str], None]
@@ -40,6 +44,10 @@ ChangeStateCallback = Callable[[str, bool, str], None]
 GET_STATE_SUFFIX = '/get_state'
 CHANGE_STATE_SUFFIX = '/change_state'
 GET_AVAILABLE_TRANSITIONS_SUFFIX = '/get_available_transitions'
+# Topic every lifecycle node publishes to on every completed transition.
+TRANSITION_EVENT_SUFFIX = '/transition_event'
+# Depth of the transition_event subscription queue.
+TRANSITION_EVENT_QUEUE_DEPTH = 10
 
 # Fully-qualified service type used to recognize a lifecycle node.
 GET_STATE_SRV_TYPE = 'lifecycle_msgs/srv/GetState'
@@ -54,6 +62,14 @@ class LifecycleManager:
     are created lazily and cached per lifecycle node. All requests are issued
     with ``call_async`` and their results are forwarded to the supplied
     callbacks from the executor thread.
+
+    Threading model: the ``async_*`` methods are meant to be called from the
+    GUI thread (typically from a ``QTimer``), while the ``_on_*_response``
+    done-callbacks run on the executor thread that spins ``node``, and may
+    overlap with each other under a ``ReentrantCallbackGroup``. The only
+    state shared between those two threads is ``_pending``, which is guarded
+    by ``_pending_lock`` to make the check-then-act membership test and the
+    add/discard that follow it atomic.
 
     Parameters
     ----------
@@ -78,8 +94,13 @@ class LifecycleManager:
         self._get_state_clients: Dict[str, Client] = {}
         self._change_state_clients: Dict[str, Client] = {}
         self._get_transitions_clients: Dict[str, Client] = {}
+        # One transition_event subscription per node currently being watched.
+        self._transition_subscriptions: Dict[str, Subscription] = {}
         # Keys of polling requests currently in flight, to avoid flooding.
+        # Mutated from both the GUI thread (add) and the executor thread
+        # (discard), so every access goes through `_pending_lock`.
         self._pending: Set[Tuple[str, str]] = set()
+        self._pending_lock = threading.Lock()
 
     # -------------------------------------------------------------------------
     # Discovery
@@ -125,13 +146,14 @@ class LifecycleManager:
 
         """
         key = (node_name, 'state')
-        if key in self._pending:
-            return
         client = self._client(
             self._get_state_clients, node_name, GET_STATE_SUFFIX, GetState)
         if not client.service_is_ready():
             return
-        self._pending.add(key)
+        with self._pending_lock:
+            if key in self._pending:
+                return
+            self._pending.add(key)
         future = client.call_async(GetState.Request())
         future.add_done_callback(
             lambda f: self._on_state_response(node_name, f, on_result, key))
@@ -152,14 +174,15 @@ class LifecycleManager:
 
         """
         key = (node_name, 'transitions')
-        if key in self._pending:
-            return
         client = self._client(
             self._get_transitions_clients, node_name,
             GET_AVAILABLE_TRANSITIONS_SUFFIX, GetAvailableTransitions)
         if not client.service_is_ready():
             return
-        self._pending.add(key)
+        with self._pending_lock:
+            if key in self._pending:
+                return
+            self._pending.add(key)
         future = client.call_async(GetAvailableTransitions.Request())
         future.add_done_callback(
             lambda f: self._on_transitions_response(
@@ -195,12 +218,82 @@ class LifecycleManager:
         future.add_done_callback(
             lambda f: self._on_change_state_response(node_name, f, on_result))
 
+    def subscribe_to_transitions(
+        self, node_name: str, on_event: StateCallback
+    ) -> None:
+        """
+        Subscribe to a node's ``transition_event`` topic for push updates.
+
+        Every lifecycle node publishes a ``TransitionEvent`` on
+        ``<node>/transition_event`` right after each completed transition,
+        with the resulting primary state as ``goal_state``. Reacting to it
+        delivers state changes instantly, instead of waiting for the next
+        polling cycle (or missing a transition triggered by another tool
+        entirely). One initial ``async_get_state()`` call when a node is
+        selected, plus this subscription, is enough to keep the displayed
+        state current without repeatedly polling it.
+
+        Calling this again for a node that is already subscribed is a no-op;
+        use ``release_node()`` first to resubscribe.
+
+        Parameters
+        ----------
+        node_name : str
+            Fully-qualified name of the target lifecycle node.
+        on_event : StateCallback
+            Called from the executor thread as ``(node_name, state_id,
+            state_label)`` whenever the node completes a transition.
+
+        """
+        if node_name in self._transition_subscriptions:
+            return
+        topic = node_name + TRANSITION_EVENT_SUFFIX
+
+        def _on_message(msg: TransitionEvent) -> None:
+            on_event(node_name, msg.goal_state.id, msg.goal_state.label)
+
+        self._transition_subscriptions[node_name] = self._node.create_subscription(
+            TransitionEvent, topic, _on_message,
+            TRANSITION_EVENT_QUEUE_DEPTH)
+
     # -------------------------------------------------------------------------
     # Lifecycle of the manager itself
     # -------------------------------------------------------------------------
 
+    def release_node(self, node_name: str) -> None:
+        """
+        Destroy every cached service client and subscription for a node.
+
+        The manager only ever talks to one node at a time (the one selected
+        in the GUI), so callers should invoke this whenever that node is
+        deselected or disappears from the graph. Without it, clients (and
+        their associated DDS resources) would otherwise accumulate for every
+        node visited during a session, only being freed on ``shutdown()``.
+
+        Parameters
+        ----------
+        node_name : str
+            Fully-qualified name of the node whose resources should be
+            freed.
+
+        """
+        for cache in (
+            self._get_state_clients,
+            self._change_state_clients,
+            self._get_transitions_clients,
+        ):
+            client = cache.pop(node_name, None)
+            if client is not None:
+                self._node.destroy_client(client)
+        subscription = self._transition_subscriptions.pop(node_name, None)
+        if subscription is not None:
+            self._node.destroy_subscription(subscription)
+        with self._pending_lock:
+            self._pending = {
+                key for key in self._pending if key[0] != node_name}
+
     def shutdown(self) -> None:
-        """Destroy every cached service client and clear internal state."""
+        """Destroy every cached client and subscription, then clear state."""
         for cache in (
             self._get_state_clients,
             self._change_state_clients,
@@ -209,7 +302,11 @@ class LifecycleManager:
             for client in cache.values():
                 self._node.destroy_client(client)
             cache.clear()
-        self._pending.clear()
+        for subscription in self._transition_subscriptions.values():
+            self._node.destroy_subscription(subscription)
+        self._transition_subscriptions.clear()
+        with self._pending_lock:
+            self._pending.clear()
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -233,7 +330,8 @@ class LifecycleManager:
         key: Tuple[str, str]
     ) -> None:
         """Forward the get_state response, guarding against failures."""
-        self._pending.discard(key)
+        with self._pending_lock:
+            self._pending.discard(key)
         try:
             response = future.result()
         except Exception as exc:  # noqa: BLE001 - surface any service error
@@ -248,7 +346,8 @@ class LifecycleManager:
         key: Tuple[str, str]
     ) -> None:
         """Forward the available-transitions response as simple tuples."""
-        self._pending.discard(key)
+        with self._pending_lock:
+            self._pending.discard(key)
         try:
             response = future.result()
         except Exception as exc:  # noqa: BLE001 - surface any service error
