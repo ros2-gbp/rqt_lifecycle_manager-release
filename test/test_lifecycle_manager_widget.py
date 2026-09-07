@@ -21,7 +21,9 @@ without needing a display server or a live ROS 2 graph.
 """
 
 import pytest
+from python_qt_binding.QtGui import QPalette
 from python_qt_binding.QtWidgets import QLabel, QPushButton
+from rqt_lifecycle_manager.lifecycle_manager import LifecycleManager
 from rqt_lifecycle_manager.lifecycle_manager_widget import (
     LifecycleManagerWidget,
 )
@@ -36,6 +38,8 @@ class _FakeManager:
         self.state_requests = []
         self.transition_requests = []
         self.change_requests = []
+        self.released_nodes = []
+        self.subscribed_nodes = []
         self.shutdown_called = False
 
     def get_lifecycle_node_names(self):
@@ -54,13 +58,21 @@ class _FakeManager:
         """Record a transition request."""
         self.change_requests.append((node_name, transition_id, on_result))
 
+    def release_node(self, node_name):
+        """Record that the caller released the given node."""
+        self.released_nodes.append(node_name)
+
+    def subscribe_to_transitions(self, node_name, on_event):
+        """Record a transition_event subscription request."""
+        self.subscribed_nodes.append((node_name, on_event))
+
     def shutdown(self):
         """Record that the widget released the backend."""
         self.shutdown_called = True
 
 
 class _FakeNode:
-    """Minimal node stub; the real manager is swapped out after building."""
+    """Minimal node stub; unused once a stub manager is injected."""
 
     def get_service_names_and_types(self):
         """Report an empty ROS 2 graph."""
@@ -69,12 +81,33 @@ class _FakeNode:
 
 @pytest.fixture
 def widget(qapp):
-    """Build a widget backed by a stub manager and tear it down after use."""
-    view = LifecycleManagerWidget(_FakeNode())
+    """Build a widget backed by an injected stub manager, then tear it down."""
     manager = _FakeManager()
-    # Replace the real backend so the tests observe the requests it receives.
-    view._manager = manager
+    view = LifecycleManagerWidget(_FakeNode(), manager=manager)
     yield view, manager
+    view.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Backend injection
+# ---------------------------------------------------------------------------
+
+
+def test_injected_manager_is_used_as_is(qapp):
+    """An explicitly injected manager is used instead of building one."""
+    manager = _FakeManager()
+
+    view = LifecycleManagerWidget(_FakeNode(), manager=manager)
+
+    assert view._manager is manager
+    view.shutdown()
+
+
+def test_defaults_to_building_a_real_manager(qapp):
+    """Without an explicit manager, a real LifecycleManager is built."""
+    view = LifecycleManagerWidget(_FakeNode())
+
+    assert isinstance(view._manager, LifecycleManager)
     view.shutdown()
 
 
@@ -122,8 +155,49 @@ def test_node_list_is_not_rebuilt_when_unchanged(widget):
     assert view._node_list.item(0) is first_item
 
 
-def test_selecting_a_node_polls_state_and_transitions(widget):
-    """Selecting a node shows its name and polls state plus transitions."""
+def test_discovering_nodes_polls_their_initial_state(widget):
+    """Every newly discovered node gets a one-off initial state read."""
+    view, manager = widget
+    manager.names = ['/a', '/b']
+
+    view._refresh()
+
+    polled = {node_name for node_name, _ in manager.state_requests}
+    assert polled == {'/a', '/b'}
+
+
+def test_discovering_nodes_subscribes_to_their_transition_events(widget):
+    """
+    Every newly discovered node gets a push-based state subscription.
+
+    This is what lets the node list act as a dashboard: every row can show
+    its own state without polling every node on each refresh cycle.
+    """
+    view, manager = widget
+    manager.names = ['/a', '/b']
+
+    view._refresh()
+
+    subscribed = {node_name for node_name, _ in manager.subscribed_nodes}
+    assert subscribed == {'/a', '/b'}
+
+
+def test_rediscovering_the_same_nodes_does_not_repoll_or_resubscribe(widget):
+    """An unchanged node set does not re-issue the initial setup calls."""
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+    polls_before = len(manager.state_requests)
+    subscriptions_before = len(manager.subscribed_nodes)
+
+    view._refresh()
+
+    assert len(manager.state_requests) == polls_before
+    assert len(manager.subscribed_nodes) == subscriptions_before
+
+
+def test_selecting_a_node_polls_its_state(widget):
+    """Selecting a node shows its name and polls its state."""
     view, manager = widget
     manager.names = ['/a']
     view._refresh()
@@ -133,7 +207,26 @@ def test_selecting_a_node_polls_state_and_transitions(widget):
     assert view._selected_node == '/a'
     assert view._node_label.text() == '/a'
     assert manager.state_requests[-1][0] == '/a'
-    assert manager.transition_requests[-1][0] == '/a'
+    # Transitions are only queried once the state response arrives.
+    assert manager.transition_requests == []
+
+
+def test_periodic_refresh_does_not_re_poll_the_selected_node(widget):
+    """
+    Once selected, the timer-driven refresh no longer polls the state.
+
+    State updates arrive via the transition_event subscription instead; the
+    periodic refresh only re-scans the discovered node list.
+    """
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+    _select_first_node(view)
+    requests_before = len(manager.state_requests)
+
+    view._refresh()
+
+    assert len(manager.state_requests) == requests_before
 
 
 def test_vanished_node_clears_the_details_panel(widget):
@@ -149,6 +242,36 @@ def test_vanished_node_clears_the_details_panel(widget):
     assert view._selected_node is None
     assert view._node_label.text() == 'No node selected'
     assert _transition_buttons(view) == []
+
+
+def test_vanished_node_releases_its_service_clients(widget):
+    """A node leaving the graph also frees its cached service clients."""
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+    _select_first_node(view)
+
+    manager.names = []
+    view._refresh()
+
+    assert manager.released_nodes == ['/a']
+
+
+def test_switching_selection_keeps_the_previous_node_subscribed(widget):
+    """
+    Selecting a new node does not release the one left behind.
+
+    Every discovered node stays subscribed for the dashboard regardless of
+    which one is selected, so deselecting a node must not tear that down.
+    """
+    view, manager = widget
+    manager.names = ['/a', '/b']
+    view._refresh()
+    view._node_list.setCurrentRow(0)
+
+    view._node_list.setCurrentRow(1)
+
+    assert manager.released_nodes == []
 
 
 def test_polling_without_selection_makes_no_request(widget):
@@ -187,6 +310,73 @@ def test_empty_selection_is_ignored(widget):
     view._on_node_selected()
 
     assert view._selected_node == '/a'
+
+
+# ---------------------------------------------------------------------------
+# Dashboard icons
+# ---------------------------------------------------------------------------
+
+
+def _item_icon_color(item):
+    """Return the hex color of a list item's solid-fill icon."""
+    return item.icon().pixmap(1, 1).toImage().pixelColor(0, 0).name()
+
+
+def test_node_without_a_known_state_has_no_icon(widget):
+    """Before any state is reported, a node's row has no icon."""
+    view, manager = widget
+    manager.names = ['/a']
+
+    view._refresh()
+
+    assert view._node_list.item(0).icon().isNull()
+
+
+@pytest.mark.parametrize('state_id, colour', [
+    (1, '#607d8b'),
+    (2, '#fb8c00'),
+    (3, '#43a047'),
+    (4, '#e53935'),
+    (13, '#29b6f6'),
+])
+def test_reported_state_colors_the_node_row(widget, state_id, colour):
+    """Reporting a node's state paints its row with the matching color."""
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+
+    view._update_state('/a', state_id, 'some-label')
+
+    item = view._node_list.item(0)
+    assert not item.icon().isNull()
+    assert _item_icon_color(item) == colour
+
+
+def test_unselected_node_still_gets_its_dashboard_icon(widget):
+    """The dashboard icon updates even for a node that is not selected."""
+    view, manager = widget
+    manager.names = ['/a', '/b']
+    view._refresh()
+    _select_first_node(view)
+
+    view._update_state('/b', 3, 'active')
+
+    other_item = view._node_list.item(1)
+    assert other_item.text() == '/b'
+    assert not other_item.icon().isNull()
+
+
+def test_vanished_node_forgets_its_cached_dashboard_state(widget):
+    """A node leaving the graph drops its cached state along with it."""
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+    view._update_state('/a', 3, 'active')
+
+    manager.names = []
+    view._refresh()
+
+    assert '/a' not in view._node_states
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +427,67 @@ def test_state_of_another_node_is_ignored(widget):
     view._update_state('/other', 4, 'finalized')
 
     assert view._state_label.text() == 'ACTIVE'
+
+
+def test_neutral_state_style_follows_the_active_palette(widget):
+    """With no state reported, the label uses the widget's palette colors."""
+    view, _ = widget
+    palette = view.palette()
+    expected_background = palette.color(QPalette.ColorRole.Window).name()
+    expected_foreground = palette.color(QPalette.ColorRole.WindowText).name()
+
+    style = view._state_label.styleSheet()
+
+    assert expected_background in style
+    assert expected_foreground in style
+
+
+# ---------------------------------------------------------------------------
+# State-driven transitions refresh
+# ---------------------------------------------------------------------------
+
+
+def test_state_change_triggers_a_transitions_request(widget):
+    """A newly reported state id triggers a fresh transitions query."""
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+    _select_first_node(view)
+
+    view._update_state('/a', 3, 'active')
+
+    assert manager.transition_requests[-1][0] == '/a'
+
+
+def test_unchanged_state_does_not_request_transitions_again(widget):
+    """Repeating the same state id does not re-query the transitions."""
+    view, manager = widget
+    manager.names = ['/a']
+    view._refresh()
+    _select_first_node(view)
+    view._update_state('/a', 3, 'active')
+    requests_before = len(manager.transition_requests)
+
+    view._update_state('/a', 3, 'active')
+
+    assert len(manager.transition_requests) == requests_before
+
+
+def test_selecting_a_node_requests_transitions_even_with_same_state_id(
+    widget,
+):
+    """Switching nodes forces a query even if the state id repeats."""
+    view, manager = widget
+    manager.names = ['/a', '/b']
+    view._refresh()
+    view._node_list.setCurrentRow(0)
+    view._update_state('/a', 3, 'active')
+    manager.transition_requests.clear()
+
+    view._node_list.setCurrentRow(1)
+    view._update_state('/b', 3, 'active')
+
+    assert manager.transition_requests[-1][0] == '/b'
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +704,48 @@ def test_re_enabling_auto_refresh_restarts_the_timer(widget):
     view.set_auto_refresh_enabled(True)
 
     assert view._refresh_timer.isActive()
+
+
+def test_default_refresh_interval_is_one_second(widget):
+    """The widget starts with the default 1000 ms polling interval."""
+    view, _ = widget
+
+    assert view.refresh_interval_ms() == 1000
+    assert view._refresh_timer.interval() == 1000
+
+
+def test_changing_the_interval_reconfigures_the_running_timer(widget):
+    """Picking a new interval takes effect immediately while active."""
+    view, _ = widget
+
+    view._interval_spinbox.setValue(2000)
+
+    assert view.refresh_interval_ms() == 2000
+    assert view._refresh_timer.interval() == 2000
+    assert view._refresh_timer.isActive()
+
+
+def test_changing_the_interval_while_stopped_does_not_start_the_timer(
+    widget,
+):
+    """A new interval is stored but does not restart a stopped timer."""
+    view, _ = widget
+    view.set_auto_refresh_enabled(False)
+
+    view._interval_spinbox.setValue(3000)
+
+    assert not view._refresh_timer.isActive()
+    view.set_auto_refresh_enabled(True)
+    assert view._refresh_timer.interval() == 3000
+
+
+def test_set_refresh_interval_restores_a_saved_value(widget):
+    """set_refresh_interval_ms() restores a previously persisted interval."""
+    view, _ = widget
+
+    view.set_refresh_interval_ms(500)
+
+    assert view.refresh_interval_ms() == 500
 
 
 def test_shutdown_stops_timer_and_releases_backend(widget):
