@@ -1,0 +1,12 @@
+Source: ros-rolling-rqt-lifecycle-manager
+Section: misc
+Priority: optional
+Maintainer: "Alberto Tudela" <ajtudela@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), python3-pytest <!nocheck>, ros-rolling-ament-copyright <!nocheck>, ros-rolling-ament-flake8 <!nocheck>, ros-rolling-ament-pep257 <!nocheck>, ros-rolling-ament-xmllint <!nocheck>, ros-rolling-ros-workspace, python3-all, python3-setuptools, dh-python
+Homepage: https://index.ros.org/p/rqt_lifecycle_manager/#rolling
+Standards-Version: 3.9.2
+
+Package: ros-rolling-rqt-lifecycle-manager
+Architecture: any
+Depends: ${python3:Depends}, ${misc:Depends}, ros-rolling-lifecycle-msgs, ros-rolling-python-qt-binding, ros-rolling-rclpy, ros-rolling-rqt-gui, ros-rolling-rqt-gui-py, ros-rolling-ros-workspace
+Description: rqt plugin to list ROS 2 lifecycle nodes and change their states from a non-blocking graphical interface.
