@@ -1,3 +1,26 @@
+## rqt_lifecycle_manager (rolling) - 0.2.0-1
+
+The packages in the `rqt_lifecycle_manager` repository were released into the `rolling` distro by running `/usr/bin/bloom-release --rosdistro rolling rqt_lifecycle_manager` on `Mon, 07 Sep 2026 10:09:24 -0000`
+
+The `rqt_lifecycle_manager` package was released.
+
+Version of package(s) in repository `rqt_lifecycle_manager`:
+
+- upstream repository: https://github.com/ajtudela/rqt_lifecycle_manager
+- release repository: https://github.com/ros2-gbp/rqt_lifecycle_manager-release.git
+- rosdistro version: `0.1.0-1`
+- old version: `0.1.0-1`
+- new version: `0.2.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## rqt_lifecycle_manager (rolling) - 0.1.0-1
 
 The packages in the `rqt_lifecycle_manager` repository were released into the `rolling` distro by running `/usr/bin/bloom-release --new-track --rosdistro rolling --track rolling rqt_lifecycle_manager` on `Tue, 01 Sep 2026 11:34:09 -0000`
